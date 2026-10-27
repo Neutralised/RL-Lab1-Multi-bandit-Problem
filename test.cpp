@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <cassert>
 #include <cstdint>
 #include <functional>
 #include <iostream>
@@ -15,12 +16,9 @@
 struct Bandit {
 	std::vector<double> mu; // 真实均值 μ_i
 	double best_mu;
-	std::vector<std::bernoulli_distribution> arms;
 
 	explicit Bandit(std::vector<double> means)
-	: mu(std::move(means)), best_mu(*std::max_element(all(mu))) {
-		for(double m : mu) arms.ep(m);
-	}
+	: mu(std::move(means)), best_mu(*std::max_element(all(mu))) {  }
 	virtual ~Bandit() = default;
 
 	int K() const { return static_cast<int>(mu.size()); }
@@ -65,7 +63,7 @@ public:
 		std::vector<int> vec;
 		for(int i = 0; i < static_cast<int>(N_.size()); ++i)
 			if(score[i] == Max) vec.ep(i);
-		std::uniform_int_distribution<int> rnd(1, static_cast<int>(vec.size()));
+		std::uniform_int_distribution<int> rnd(0, static_cast<int>(vec.size()) - 1);
 		return vec[rnd(rng)];
 	}
 	std::vector<double> estimate() const {
@@ -77,6 +75,7 @@ public:
 
 class Greedy : public Solver {
 public:
+	using Solver::Solver;
 	int select(uint64_t t, std::mt19937_64 &rng) override {
 		return random_select_max(estimate(), rng);
 	}
@@ -93,7 +92,7 @@ public:
 		auto score = estimate();
 		double Max = *std::max_element(all(score));
 		std::uniform_real_distribution<double> u(0.0, 1.0);
-		if(Max == +oo || u(rng) >= eps_) return random_select_max(estimate(), rng);
+		if(Max == +oo || u(rng) >= eps_) return random_select_max(score, rng);
 		return std::uniform_int_distribution<int>(0, K() - 1)(rng);
 	}
 };
@@ -166,7 +165,7 @@ Experiment experiment(const std::vector<double> &means,
 	return cur;
 }
 
-main() {
+int main() {
 	constexpr int runs = 100;
 	const std::vector<double> means_bernoulli = { 0.2, 0.3, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.8 };
 	const std::vector<double> means_gaussian = { 0.705, 1.294, -0.574, 0.398, -1.907, 1.119, -0.724, -1.492, 0.015, -0.309 };
@@ -183,8 +182,8 @@ main() {
 
 	const std::vector<std::pair<std::string, Solver_Factory>> algos = {
 		{"greedy", 			[](int K) { return std::make_unique<Greedy>(K); }},
-		{"ε-greedy 0.05",   [](int K) { return std::make_unique<Epsilon_Greedy>(K, 0.05); }},
-		{"ε-greedy 0.1",    [](int K) { return std::make_unique<Epsilon_Greedy>(K, 0.1); }},
+		{"eps-greedy 0.05",   [](int K) { return std::make_unique<Epsilon_Greedy>(K, 0.05); }},
+		{"eps-greedy 0.1",    [](int K) { return std::make_unique<Epsilon_Greedy>(K, 0.1); }},
 		{"UCB 0.5",         [](int K) { return std::make_unique<UCB>(K, 0.5); }},
 		{"UCB sqrt2",       [](int K) { return std::make_unique<UCB>(K, sqrt(2.0)); }},
 		{"UCB 2", 		    [](int K) { return std::make_unique<UCB>(K, 2); }},
@@ -195,10 +194,14 @@ main() {
 		else std::cout << "===== Gaussian Distribution: K = 10, sigma = 1, runs = " << runs << " =====\nT\t";
 		for(auto &[name, func] : algos) std::cout << name << '\t';
 		std::cout << '\n';
+		const Env_Factory env_f = [type](const std::vector<double> &m) -> std::unique_ptr<Bandit> {
+			if(type) return std::make_unique<Gaussian_Bandit>(m, 1.0);
+			return std::make_unique<Bernoulli_Bandit>(m);
+		};
 		for(int T : {1000, 5000, 20000}) {
 			std::cout << T << '\t';
 			for(auto &[name, func] : algos) {
-				const Experiment exp_ = experiment(type ? means_gaussian : means_bernoulli, func, T, runs);
+				const Experiment exp_ = experiment(type ? means_gaussian : means_bernoulli, func, T, runs, 114514, env_f);
 				std::cout << exp_.mean_regret.back() << '\t';
 			}
 			std::cout << '\n';
@@ -206,5 +209,16 @@ main() {
 	};
 	run_exp(0); // 伯努利分布环境
 	run_exp(1); // 正态分布环境
-	
+
+	// 验证 regret R_T = \sum_i \Delta_i N_i(T)
+	std::mt19937_64 rng(67);
+	Bernoulli_Bandit env(means_bernoulli);
+	UCB sol(env.K(), 0.5);
+	const Episode now = run(env, sol, 5000, rng);
+	double rhs = 0.0;
+	for(int i = 0; i < env.K(); ++i)
+		rhs += (env.best_mu - env.mu[i]) * static_cast<double>(now.counts[i]);
+	std::cout << "[test] regret: R_T = " << now.regret.back() << ", ";
+	std::cout << "sum Delta_i N_i(T) = " << rhs << ", ";
+	std::cout << "diff = " << std::abs(now.regret.back() - rhs) << '\n';
 }

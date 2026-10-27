@@ -1,2 +1,5 @@
 .reasonix/
 ref/
+.vscode/
+
+test.exe
