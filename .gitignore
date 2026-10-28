@@ -1,5 +1,6 @@
 .reasonix/
 ref/
 .vscode/
+results/
 
 test.exe

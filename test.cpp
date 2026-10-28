@@ -1,17 +1,28 @@
 #include <algorithm>
-#include <cmath>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
+#include <fstream>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <random>
 #include <string>
 #include <vector>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 
 #define ep emplace_back
 #define all(x) begin(x), end(x)
+#ifdef _WIN32
+#define MAKE_DIR(p) _mkdir(p)
+#else
+#define MAKE_DIR(p) mkdir(p, 0755)
+#endif
 
 struct Bandit {
 	std::vector<double> mu; // 真实均值 μ_i
@@ -77,6 +88,7 @@ class Greedy : public Solver {
 public:
 	using Solver::Solver;
 	int select(uint64_t t, std::mt19937_64 &rng) override {
+		(void)t; // Greedy 不需要轮次信息
 		return random_select_max(estimate(), rng);
 	}
 };
@@ -88,6 +100,7 @@ private:
 public:
 	Epsilon_Greedy(int K, double eps) : Solver(K), eps_(eps) {  }
 	int select(uint64_t t, std::mt19937_64 &rng) override {
+		(void)t;
 		static const double oo = std::numeric_limits<double>::infinity();
 		auto score = estimate();
 		double Max = *std::max_element(all(score));
@@ -113,6 +126,24 @@ public:
 	}
 };
 
+class Reducing_Epsilon_Greedy : public Solver {
+private:
+	double eps_;
+	int K() const { return static_cast<int>(N_.size()); }
+public:
+	Reducing_Epsilon_Greedy(int K, double eps) : Solver(K), eps_(eps) {  }
+	int select(uint64_t t, std::mt19937_64 &rng) override {
+		static const double oo = std::numeric_limits<double>::infinity();
+		auto score = estimate();
+		double Max = *std::max_element(all(score));
+		std::uniform_real_distribution<double> u(0.0, 1.0);
+		// ε_t = ε_0 / sqrt(t)：探索概率随时间衰减
+		if(Max == +oo || u(rng) >= eps_ / std::sqrt(static_cast<double>(t))) return random_select_max(score, rng);
+		return std::uniform_int_distribution<int>(0, K() - 1)(rng);
+	}
+};
+
+// ============================ 单条轨迹 ============================
 struct Episode {
 	std::vector<double> regret;
 	std::vector<uint64_t> counts;
@@ -133,14 +164,71 @@ Episode run(Bandit &env, Solver &sol, int T, std::mt19937_64 &rng) {
 	return cur;
 }
 
+// ============================ 多次重复的统计量 ============================
 struct Experiment {
-	std::vector<double> mean_regret;
-	std::vector<double> mean_counts;
+	std::vector<double> mean_regret; // 每个时刻的平均累积 regret
+	std::vector<double> mean_counts; // 每个臂的平均选择次数
+};
+
+struct Experiment_Full {
+	std::vector<double> mean_regret; // 每个时刻的平均累积 regret
+	std::vector<double> se_regret;   // 每个时刻的标准误（用于画置信带）
+	std::vector<double> opt_ratio;   // 每个时刻的"累计选中最优臂的比例"的平均
+	std::vector<double> mean_counts; // 每个臂的平均选择次数
 };
 
 using Solver_Factory = std::function<std::unique_ptr<Solver>(int)>;
 using Env_Factory = std::function<std::unique_ptr<Bandit>(const std::vector<double>&)>;
 
+Experiment_Full experiment_full(const std::vector<double> &means,
+								const Solver_Factory &sol_factory,
+								int T, int runs,
+								std::uint64_t seed,
+								const Env_Factory &env_factory) {
+	const int K = static_cast<int>(means.size());
+	const double best = *std::max_element(all(means));
+	std::vector<char> is_opt(K, 0);
+	for(int i = 0; i < K; ++i) is_opt[i] = (means[i] == best);
+
+	Experiment_Full cur;
+	cur.mean_regret.assign(T, 0.0);
+	cur.se_regret.assign(T, 0.0);
+	cur.opt_ratio.assign(T, 0.0);
+	cur.mean_counts.assign(K, 0.0);
+	std::vector<double> sq(T, 0.0); // 平方和
+
+	for(int k = 0; k < runs; ++k) {
+		std::mt19937_64 rng(seed + k);
+		auto env = env_factory(means);
+		auto sol = sol_factory(env -> K());
+
+		std::vector<double> reg(T);
+		double tot = 0.0;
+		long long opt = 0;
+		for(int t = 1; t <= T; ++t) {
+			int id = sol -> select(t, rng);
+			double r = env -> step(id, rng);
+			sol -> update(id, r);
+			tot += env -> best_mu - env -> mu[id];
+			reg[t - 1] = tot;
+			if(is_opt[id]) ++opt;
+			cur.opt_ratio[t - 1] += static_cast<double>(opt) / t / runs;
+		}
+		for(int t = 0; t < T; ++t) {
+			cur.mean_regret[t] += reg[t] / runs;
+			sq[t] += reg[t] * reg[t] / runs;
+		}
+		auto cnt = sol -> counts();
+		for(int i = 0; i < K; ++i) cur.mean_counts[i] += cnt[i] / static_cast<double>(runs);
+	}
+	for(int t = 0; t < T; ++t) { // SE = sqrt((E[x^2] - E[x]^2) / runs)
+		const double var = sq[t] - cur.mean_regret[t] * cur.mean_regret[t];
+		cur.se_regret[t] = var > 0.0 ? std::sqrt(var / runs) : 0.0;
+	}
+	return cur;
+}
+
+// 旧接口：只返回均值（保留下来供对照，内部复用 experiment_full）
 Experiment experiment(const std::vector<double> &means,
 					  const Solver_Factory& sol_factory,
 					  int T, int runs,
@@ -148,69 +236,153 @@ Experiment experiment(const std::vector<double> &means,
 					  const Env_Factory &env_factory = [](const std::vector<double> &m) -> std::unique_ptr<Bandit> {
 						return std::make_unique<Bernoulli_Bandit>(m);
 					  }) {
-	const int K = static_cast<int>(means.size());
-	Experiment cur;
-	cur.mean_regret.assign(T, 0.0);
-	cur.mean_counts.assign(K, 0.0);
-	for(int k = 0; k < runs; ++k) {
-		std::mt19937_64 rng(seed + k);
-		auto env = env_factory(means);
-		auto sol = sol_factory(env -> K());
-		const Episode now = run(*env, *sol, T, rng);
-		for(int t = 0; t < T; ++t)
-			cur.mean_regret[t] += now.regret[t] / static_cast<double>(runs);
-		for(int i = 0; i < K; ++i)
-			cur.mean_counts[i] += now.counts[i] / static_cast<double>(runs);
-	}
-	return cur;
+	const Experiment_Full full = experiment_full(means, sol_factory, T, runs, seed, env_factory);
+	return Experiment{ full.mean_regret, full.mean_counts };
 }
 
-int main() {
-	constexpr int runs = 100;
-	const std::vector<double> means_bernoulli = { 0.2, 0.3, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.8 };
-	const std::vector<double> means_gaussian = { 0.705, 1.294, -0.574, 0.398, -1.907, 1.119, -0.724, -1.492, 0.015, -0.309 };
-	/*
-		正态分布的均值使用
-		```
-		std::mt19937_64 rng(42);
-		std::normal_distribution<double> N01(0.0, 1.0);
-		std::vector<double> means(10);
-		for (double& m : means) m = N01(rng);
-		```
-		生成
-	*/
+// ============================ CSV 输出 ============================
+struct Csv_Writer {
+	std::ofstream curves, summary, counts;
 
-	const std::vector<std::pair<std::string, Solver_Factory>> algos = {
-		{"greedy", 			[](int K) { return std::make_unique<Greedy>(K); }},
-		{"eps-greedy 0.05",   [](int K) { return std::make_unique<Epsilon_Greedy>(K, 0.05); }},
-		{"eps-greedy 0.1",    [](int K) { return std::make_unique<Epsilon_Greedy>(K, 0.1); }},
-		{"UCB 0.5",         [](int K) { return std::make_unique<UCB>(K, 0.5); }},
-		{"UCB sqrt2",       [](int K) { return std::make_unique<UCB>(K, sqrt(2.0)); }},
-		{"UCB 2", 		    [](int K) { return std::make_unique<UCB>(K, 2); }},
-	};
-
-	auto run_exp = [&](bool type) -> void {
-		if(!type) std::cout << "===== Bernoulli Distribution: K = 10, runs = " << runs << " =====\nT\t";
-		else std::cout << "===== Gaussian Distribution: K = 10, sigma = 1, runs = " << runs << " =====\nT\t";
-		for(auto &[name, func] : algos) std::cout << name << '\t';
-		std::cout << '\n';
-		const Env_Factory env_f = [type](const std::vector<double> &m) -> std::unique_ptr<Bandit> {
-			if(type) return std::make_unique<Gaussian_Bandit>(m, 1.0);
-			return std::make_unique<Bernoulli_Bandit>(m);
-		};
-		for(int T : {1000, 5000, 20000}) {
-			std::cout << T << '\t';
-			for(auto &[name, func] : algos) {
-				const Experiment exp_ = experiment(type ? means_gaussian : means_bernoulli, func, T, runs, 114514, env_f);
-				std::cout << exp_.mean_regret.back() << '\t';
-			}
-			std::cout << '\n';
+	Csv_Writer() {
+		MAKE_DIR("results");
+		curves.open("results/curves.csv");
+		summary.open("results/summary.csv");
+		counts.open("results/counts.csv");
+		for(std::ofstream *f : { &curves, &summary, &counts }) {
+			(*f) << std::fixed << std::setprecision(6);
 		}
-	};
-	run_exp(0); // 伯努利分布环境
-	run_exp(1); // 正态分布环境
+		curves << "experiment,env,algo,param_name,param_value,T,runs,t,mean_regret,se_regret,opt_ratio\n";
+		summary << "experiment,env,algo,param_name,param_value,T,runs,K,mu_star,delta_min,mean_delta,"
+				   "final_regret,regret_per_t,opt_ratio_final\n";
+		counts << "experiment,env,algo,param_name,param_value,T,arm,mu,count\n";
+	}
+	bool ok() const { return curves.is_open() && summary.is_open() && counts.is_open(); }
+};
 
-	// 验证 regret R_T = \sum_i \Delta_i N_i(T)
+// 把一条实验的结果写进三个 CSV：逐步曲线、终值汇总、每臂选择次数
+void record(Csv_Writer &csv, const std::string &exp, const std::string &env_name,
+			const std::string &algo, const std::string &param_name, double param_value,
+			const std::vector<double> &means, int T, int runs,
+			const Experiment_Full &e, int max_points = 200) {
+	const int K = static_cast<int>(means.size());
+	const double best = *std::max_element(all(means));
+	double delta_min = std::numeric_limits<double>::infinity();
+	double delta_sum = 0.0;
+
+	for(int i = 0; i < K; ++i) {
+		const double d = best - means[i];
+		if(d > 0.0) {
+			delta_min = std::min(delta_min, d);
+			delta_sum += d;
+		}
+	}
+	if(!std::isfinite(delta_min)) delta_min = 0.0; // 所有臂并列时
+
+	const int stride = std::max(1, T / max_points);
+	for(int t = 1; t <= T; ++t) {
+		if(t % stride != 0 && t != T) continue; // 只保留 ~max_points 个采样点，避免 CSV 过大
+		csv.curves << exp << ',' << env_name << ',' << algo << ',' << param_name << ',' << param_value << ','
+				   << T << ',' << runs << ',' << t << ','
+				   << e.mean_regret[t - 1] << ',' << e.se_regret[t - 1] << ',' << e.opt_ratio[t - 1] << '\n';
+	}
+
+	csv.summary << exp << ',' << env_name << ',' << algo << ',' << param_name << ',' << param_value << ','
+				<< T << ',' << runs << ',' << K << ',' << best << ',' << delta_min << ','
+				<< (K > 1 ? delta_sum / (K - 1) : 0.0) << ','
+				<< e.mean_regret.back() << ',' << e.mean_regret.back() / T << ','
+				<< e.opt_ratio.back() << '\n';
+
+	for(int i = 0; i < K; ++i)
+		csv.counts << exp << ',' << env_name << ',' << algo << ',' << param_name << ',' << param_value << ','
+				   << T << ',' << i << ',' << means[i] << ',' << e.mean_counts[i] << '\n';
+}
+
+// ============================ 实验配置 ============================
+main() {
+	constexpr int runs = 200;   // 每个配置重复的次数
+	constexpr std::uint64_t seed = 114514;
+
+	const std::vector<double> means_bernoulli = { 0.2, 0.3, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.8 };
+	// 正态分布的真值：由 std::mt19937_64 rng(42) + N(0,1) 抽样得到
+	const std::vector<double> means_gaussian = { 0.705, 1.294, -0.574, 0.398, -1.907, 1.119, -0.724, -1.492, 0.015, -0.309 };
+
+	const Env_Factory bern = [](const std::vector<double> &m) -> std::unique_ptr<Bandit> {
+		return std::make_unique<Bernoulli_Bandit>(m);
+	};
+	const Env_Factory gauss = [](const std::vector<double> &m) -> std::unique_ptr<Bandit> {
+		return std::make_unique<Gaussian_Bandit>(m, 1.0);
+	};
+
+	// 主实验用到的算法集合
+	const std::vector<std::pair<std::string, Solver_Factory>> algos = {
+		{"greedy",                     [](int K) { return std::make_unique<Greedy>(K); }},
+		{"eps-greedy 0.01",            [](int K) { return std::make_unique<Epsilon_Greedy>(K, 0.01); }},
+		{"eps-greedy 0.05",            [](int K) { return std::make_unique<Epsilon_Greedy>(K, 0.05); }},
+		{"eps-greedy 0.1",             [](int K) { return std::make_unique<Epsilon_Greedy>(K, 0.1); }},
+		{"reducing-eps-greedy 0.05",   [](int K) { return std::make_unique<Reducing_Epsilon_Greedy>(K, 0.05); }},
+		{"UCB 0.5",                    [](int K) { return std::make_unique<UCB>(K, 0.5); }},
+		{"UCB sqrt2",                  [](int K) { return std::make_unique<UCB>(K, std::sqrt(2.0)); }},
+		{"UCB 2",                      [](int K) { return std::make_unique<UCB>(K, 2.0); }},
+	};
+	// T 扫描与 gap 扫描只用三个代表算法，控制运行时间
+	const std::vector<std::pair<std::string, Solver_Factory>> algos_few = {
+		{"greedy",                     [](int K) { return std::make_unique<Greedy>(K); }},
+		{"eps-greedy 0.05",            [](int K) { return std::make_unique<Epsilon_Greedy>(K, 0.05); }},
+		{"UCB sqrt2",                  [](int K) { return std::make_unique<UCB>(K, std::sqrt(2.0)); }},
+	};
+
+	Csv_Writer csv;
+	if(!csv.ok()) {
+		std::cerr << "无法写入 results/*.csv，请确认当前目录可写\n";
+		return 1;
+	}
+
+	// ---------- E1：基准环境下的算法对比（K=10，T=2000） ----------
+	for(auto &[name, f] : algos) {
+		const auto e = experiment_full(means_bernoulli, f, 2000, runs, seed, bern);
+		record(csv, "E1_algorithms", "bernoulli", name, "-", 0, means_bernoulli, 2000, runs, e);
+	}
+	// ---------- E6：同一组算法在高斯环境（sigma=1）下的对比 ----------
+	for(auto &[name, f] : algos) {
+		const auto e = experiment_full(means_gaussian, f, 2000, runs, seed, gauss);
+		record(csv, "E6_gaussian", "gaussian", name, "-", 0, means_gaussian, 2000, runs, e);
+	}
+
+	// ---------- E2：只改 T ----------
+	for(int T : {200, 500, 1000, 2000, 5000, 10000}) {
+		for(auto &[name, f] : algos_few) {
+			const auto e = experiment_full(means_bernoulli, f, T, runs, seed, bern);
+			record(csv, "E2_horizon", "bernoulli", name, "T", T, means_bernoulli, T, runs, e);
+		}
+	}
+
+	// ---------- E3：只改均值差距（K=2，mu=(0.6, 0.6-gap)） ----------
+	for(double gap : {0.3, 0.2, 0.1, 0.05, 0.02, 0.01}) {
+		const std::vector<double> means = { 0.6, 0.6 - gap };
+		for(auto &[name, f] : algos_few) {
+			const auto e = experiment_full(means, f, 5000, runs, seed, bern);
+			record(csv, "E3_gap", "bernoulli", name, "gap", gap, means, 5000, runs, e);
+		}
+	}
+
+	// ---------- E4：只改 eps ----------
+	for(double eps : {0.0, 0.001, 0.01, 0.05, 0.1, 0.2, 0.3, 1.0}) {
+		Solver_Factory f = [eps](int K) { return std::make_unique<Epsilon_Greedy>(K, eps); };
+		const auto e = experiment_full(means_bernoulli, f, 2000, runs, seed, bern);
+		record(csv, "E4_epsilon", "bernoulli", "eps-greedy", "eps", eps, means_bernoulli, 2000, runs, e);
+	}
+
+	// ---------- E5：只改 UCB 的 c ----------
+	for(double c : {0.1, 0.2, 0.3, 0.5, 0.75, 1.0, std::sqrt(2.0), 2.0, 4.0}) {
+		Solver_Factory f = [c](int K) { return std::make_unique<UCB>(K, c); };
+		const auto e = experiment_full(means_bernoulli, f, 2000, runs, seed, bern);
+		record(csv, "E5_ucb_c", "bernoulli", "UCB", "c", c, means_bernoulli, 2000, runs, e);
+	}
+
+	std::cout << "CSV 写入完成：results/curves.csv, results/summary.csv, results/counts.csv\n";
+
+	// ---------- 校验：R_T = sum_i Delta_i N_i(T) ----------
 	std::mt19937_64 rng(67);
 	Bernoulli_Bandit env(means_bernoulli);
 	UCB sol(env.K(), 0.5);
